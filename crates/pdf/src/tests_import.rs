@@ -376,3 +376,9 @@ fn postscript_radix_numbers_outside_2_to_36_are_not_numbers() {
         let _ = parse(src.as_bytes());
     }
 }
+
+#[test]
+fn extreme_page_indices_have_a_printable_error() {
+    let text = Error::PageOutOfRange(usize::MAX).to_string();
+    assert!(text.starts_with("the PDF has no page "));
+}
