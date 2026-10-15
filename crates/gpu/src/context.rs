@@ -316,6 +316,8 @@ pub struct GpuContext {
     uploads: Mutex<Uploads>,
     upload_budget: std::sync::atomic::AtomicUsize,
     upload_full_warned: std::sync::atomic::AtomicBool,
+    /// Back-pressure on frames in flight (see [`crate::memcap`]).
+    memcap: crate::memcap::MemCap,
     pool: Arc<Mutex<Pool>>,
     /// CPU ↔ GPU traffic (diagnostics: `bench --gpu`).
     pub(crate) transfers: Transfers,
@@ -663,6 +665,7 @@ impl GpuContext {
             uploads: Mutex::new(Uploads::default()),
             upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
             upload_full_warned: Default::default(),
+            memcap: crate::memcap::MemCap::new(&info),
             pool: Default::default(),
             staging: Default::default(),
             transfers: Default::default(),
@@ -1011,6 +1014,21 @@ pub(crate) struct Enc<'g> {
     owner: u64,
     /// `owner` is lent ([`Enc::lent`]) and outlives this `Enc`.
     lent: bool,
+}
+
+impl Enc<'_> {
+    /// Memory back-pressure (see [`crate::memcap`]): once the allocator holds more than the
+    /// cap, submit this frame's work and wait for the queue so wgpu frees what was dropped.
+    pub(crate) fn mem_gate(&mut self) {
+        let Some(cap) = self.g.memcap.due() else { return };
+        let Some(r) = self.g.device.generate_allocator_report() else { return };
+        if r.total_allocated_bytes <= cap {
+            return;
+        }
+        self.g.memcap.waited();
+        self.submit();
+        let _ = self.g.poll_readbacks(wgpu::PollType::Wait { submission_index: None, timeout: Some(crate::readback::TIMEOUT) });
+    }
 }
 
 impl Drop for Enc<'_> {
