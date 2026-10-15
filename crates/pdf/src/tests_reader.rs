@@ -48,7 +48,11 @@ fn a_long_cyclic_reference_graph_does_not_expand_recursively() {
 #[test]
 fn excessive_inline_nesting_returns_an_error_instead_of_partial_art() {
     let extra = format!("/Extra {}0{}", "[".repeat(80), "]".repeat(80));
-    assert!(matches!(parse(&document(&extra, &[])), Err(Error::Read(message)) if message.contains("64 nested objects")));
+    let bytes = document(&extra, &[]);
+    // The shared parser rejects the catalog before the adapter's depth limit runs.
+    // Its Invalid result follows the existing NoPages mapping, with no partial document.
+    assert_eq!(crate::page_count(&bytes), 0);
+    assert_eq!(parse(&bytes), Err(Error::NoPages));
 }
 
 fn object_stream(entries: &[(u32, &str)]) -> String {

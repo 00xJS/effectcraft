@@ -305,6 +305,39 @@ impl Reader<'_> {
 mod limit_tests {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn shared_reader_preserves_tolerant_array_numbers_and_later_pages() {
+        use crate::object::Obj;
+
+        // Array validation accepts these sign/dot-only zero tokens. Previously '+'
+        // reached an unchecked lazy-iterator read: native loading returned an internal
+        // parser error and WASM could abort before reaching the following object.
+        for token in ["+", "-", ".", "+.", "-."] {
+            for numeric_kid in [false, true] {
+                let kids = if numeric_kid { format!("{token} 3 0 R") } else { "3 0 R".into() };
+                let bytes = crate::write::pdf(
+                    &[
+                        (1, format!("<< /Type /Catalog /Pages 2 0 R /Probe [{token} 3] >>"), None),
+                        (2, format!("<< /Type /Pages /Kids [{kids}] /Count 1 >>"), None),
+                        (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 40 20] /Resources << >> /Contents 4 0 R >>".into(), None),
+                        (4, "<< >>".into(), Some(b"1 0 0 rg 0 0 40 20 re f\n".to_vec())),
+                    ],
+                    1,
+                );
+                let file = super::open(&bytes).unwrap();
+                assert_eq!(file.catalog().unwrap().get("Probe").and_then(Obj::array), Some([Obj::Num(0.0), Obj::Num(3.0)].as_slice()));
+                assert_eq!(crate::page_count(&bytes), 1, "token {token}, numeric kid {numeric_kid}");
+                let doc = crate::parse(&bytes).unwrap();
+                assert_eq!((doc.width, doc.height), (40.0, 20.0));
+                assert_eq!(doc.flatten().len(), 1);
+                assert!(doc.skipped.is_empty(), "{:?}", doc.skipped);
+                assert_eq!(effectcraft_svg::rasterize(&doc, 40, 20, 1.0).get(20, 10), [1.0, 0.0, 0.0, 1.0]);
+                assert_eq!(crate::parse_page(&bytes, 1), Err(crate::Error::PageOutOfRange(1)));
+            }
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn shared_reader_preserves_the_target_stream_budget() {
         let options = super::open_options();
         let expected = if cfg!(target_pointer_width = "32") { 64 << 20 } else { 256 << 20 };
