@@ -24,9 +24,10 @@ const ENTRIES: &[&str] = &[
     "fill",
 ];
 
-/// Effect entry points in `kernels.wgsl`. Like the `fx_*` kernels, one that fails to build
-/// (a driver's shader compiler rejecting it, #613) leaves its effects to the CPU instead of
-/// turning the whole compositor off.
+/// Effect entry points in `kernels.wgsl`. Like the `fx_*` kernels, they are built on first use
+/// (building all ~200 up front kept Chrome's GPU process busy past its watchdog, #1590, and
+/// FXC took over a minute, #613), and one that fails to build (a driver's shader compiler
+/// rejecting it) leaves its effects to the CPU instead of turning the whole compositor off.
 const EFFECT_ENTRIES: &[&str] = &["box_h", "box_v", "directional", "glow_bright", "glow_combine", "shadow_make", "shadow_combine", "pointwise"];
 
 /// Entry points that also bind group 1 (four read-only storage buffers; see
@@ -285,9 +286,14 @@ pub struct GpuContext {
     pub(crate) max_dim: u32,
     bgl: wgpu::BindGroupLayout,
     bgl_ext: wgpu::BindGroupLayout,
+    /// The kernels module and its group 0 layout, for building effect kernels on first use.
+    module: wgpu::ShaderModule,
+    layout: wgpu::PipelineLayout,
+    /// The compositor's own kernels (built up front: the compositor can't run without them).
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
-    /// Effect kernels that failed to build, and why (their effects render on the CPU).
-    unavailable: Vec<(&'static str, String)>,
+    /// Effect kernels, built on first dispatch; `Err` says why one didn't build (its effects
+    /// render on the CPU).
+    effect_pipelines: HashMap<&'static str, std::sync::OnceLock<Result<wgpu::ComputePipeline, String>>>,
     display_bgl: wgpu::BindGroupLayout,
     display: wgpu::ComputePipeline,
     /// The display texture's next mip level from the one above (`display.wgsl` `mip`).
@@ -370,6 +376,25 @@ pub(crate) fn init_resource<T>(device: &wgpu::Device, label: &str, create: impl 
 #[cfg(target_arch = "wasm32")]
 fn init_resource<T>(_device: &wgpu::Device, _label: &str, create: impl FnOnce() -> T) -> Result<T, String> {
     Ok(create())
+}
+
+/// Compute pipeline `entry` of `module`; a shader compiler rejecting it (FXC, #613) is an `Err`.
+fn build_pipeline(
+    device: &wgpu::Device,
+    module: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    entry: &'static str,
+) -> Result<wgpu::ComputePipeline, String> {
+    init_resource(device, entry, || {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(layout),
+            module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    })
 }
 
 /// A buffer holding `contents` (padded to 4 bytes), written through the queue. Unlike
@@ -523,29 +548,17 @@ impl GpuContext {
                 immediate_size: 0,
             })
         })?;
-        let build = |e: &'static str, layout: &wgpu::PipelineLayout| {
-            init_resource(&device, e, || {
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(e),
-                    layout: Some(layout),
-                    module: &module,
-                    entry_point: Some(e),
-                    compilation_options: Default::default(),
-                    cache: None,
-                })
-            })
-        };
-        // The compositor's own kernels are required; an effect kernel that doesn't build is
-        // left out, and its effects render on the CPU (see `Enc::take_missing`).
-        let mut pipelines = ENTRIES
+        // The compositor's own kernels are required and built now; effect kernels are built on
+        // first use (`GpuContext::pipeline`), and one that doesn't build is left out, its
+        // effects rendering on the CPU (see `Enc::take_missing`).
+        let pipelines = ENTRIES
             .iter()
             .chain(crate::adv3d::SKY_KERNELS)
             .map(|e| (e, &layout))
             .chain(EXT_ENTRIES.iter().map(|e| (e, &layout_ext)))
-            .map(|(e, layout)| Ok((*e, build(e, layout)?)))
+            .map(|(e, layout)| Ok((*e, build_pipeline(&device, &module, layout, e)?)))
             .collect::<Result<HashMap<_, _>, String>>()?;
-        let mut unavailable = vec![];
-        for e in EFFECT_ENTRIES
+        let effect_pipelines = EFFECT_ENTRIES
             .iter()
             .chain(crate::fx_color::KERNELS)
             .chain(crate::fx_distort::KERNELS)
@@ -567,17 +580,8 @@ impl GpuContext {
             .chain(crate::fx_time::KERNELS)
             .chain(crate::fx_pixel2::KERNELS)
             .chain(crate::fx_gen2::KERNELS)
-        {
-            match build(e, &layout) {
-                Ok(p) => {
-                    pipelines.insert(*e, p);
-                }
-                Err(why) => {
-                    log::warn!("gpu {name}: kernel {e} unavailable, its effects render on the CPU: {why}");
-                    unavailable.push((*e, why));
-                }
-            }
-        }
+            .map(|e| (*e, std::sync::OnceLock::new()))
+            .collect();
         let dmodule = init_resource(&device, "display shader module", || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("effectcraft display"),
@@ -634,8 +638,10 @@ impl GpuContext {
             max_dim,
             bgl,
             bgl_ext,
+            module,
+            layout,
             pipelines,
-            unavailable,
+            effect_pipelines,
             display_bgl,
             display,
             display_mip,
@@ -812,16 +818,60 @@ impl GpuContext {
 
     /// Readbacks (GPU → CPU) are possible: waited for natively, or deferred (a browser
     /// worker, [`crate::deferred`]). Impossible on the browser's main thread.
-    /// Effect kernels the device couldn't build, with why: their effects render on the CPU.
-    pub fn unavailable_kernels(&self) -> &[(&'static str, String)] {
-        &self.unavailable
+    /// Effect kernels the device couldn't build so far, with why: their effects render on the
+    /// CPU. Kernels are built on first use, so one not used yet isn't listed.
+    pub fn unavailable_kernels(&self) -> Vec<(&'static str, String)> {
+        let mut out: Vec<_> = self
+            .effect_pipelines
+            .iter()
+            .filter_map(|(e, cell)| match cell.get() {
+                Some(Err(why)) => Some((*e, why.clone())),
+                _ => None,
+            })
+            .collect();
+        out.sort_unstable_by_key(|(e, _)| *e);
+        out
+    }
+
+    /// Kernel `entry`'s pipeline: one of the compositor's own, or an effect kernel, built the
+    /// first time it is asked for. `None` when the device doesn't have it.
+    fn pipeline(&self, entry: &str) -> Option<&wgpu::ComputePipeline> {
+        if let Some(p) = self.pipelines.get(entry) {
+            return Some(p);
+        }
+        let Some((e, cell)) = self.effect_pipelines.get_key_value(entry) else {
+            log::error!("gpu: no kernel {entry}");
+            return None;
+        };
+        let built = cell.get_or_init(|| {
+            let built = build_pipeline(&self.device, &self.module, &self.layout, e);
+            if let Err(why) = &built {
+                log::warn!("gpu {}: kernel {e} unavailable, its effects render on the CPU: {why}", self.name);
+            }
+            built
+        });
+        built.as_ref().ok()
+    }
+
+    /// Build every effect kernel not built yet (tests; and a host that would rather pay the
+    /// compile time up front than on first use).
+    pub fn build_all_kernels(&self) {
+        for e in self.effect_pipelines.keys() {
+            let _ = self.pipeline(e);
+        }
+    }
+
+    /// How many effect kernels have been built (tests).
+    #[cfg(test)]
+    pub(crate) fn effect_pipelines_built(&self) -> usize {
+        self.effect_pipelines.values().filter(|cell| matches!(cell.get(), Some(Ok(_)))).count()
     }
 
     /// Leave kernel `entry` out, as if it had failed to build (tests of the CPU fallback).
     #[cfg(test)]
     pub(crate) fn drop_kernel(&mut self, entry: &'static str) {
         self.pipelines.remove(entry);
-        self.unavailable.push((entry, "dropped by a test".into()));
+        self.effect_pipelines.insert(entry, std::sync::OnceLock::from(Err("dropped by a test".into())));
     }
 
     /// Bytes of readback staging buffers kept for reuse (tests).
@@ -1099,10 +1149,7 @@ impl<'g> Enc<'g> {
         ext: Option<[&wgpu::Buffer; 4]>,
     ) {
         let g = self.g;
-        let Some(pipe) = g.pipelines.get(entry) else {
-            if !g.unavailable.iter().any(|(e, _)| *e == entry) {
-                log::error!("gpu: no kernel {entry}");
-            }
+        let Some(pipe) = g.pipeline(entry) else {
             self.missing = true;
             return;
         };
