@@ -264,6 +264,11 @@ pub mod noop;
 pub mod vulkan;
 
 pub mod auxil;
+
+/// EffectCraft patch (#613): marks this patched copy; `effectcraft-gpu` refers to it so a build that
+/// leaves the patch unused fails to compile.
+pub const EFFECTCRAFT_PATCH_613: () = ();
+
 pub mod api {
     #[cfg(dx12)]
     pub use super::dx12::Api as Dx12;
