@@ -190,6 +190,8 @@ fn dx12_kernel_report() {
     desc.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc.with_env();
     let Some((adapter, device, queue)) = native_device(desc, false) else { return };
     let ctx = GpuContext::new(&adapter, device, queue).expect("compositor starts on DirectX 12");
+    // Effect kernels are built on first use (#1590): build them all to report every one.
+    ctx.build_all_kernels();
     for (entry, why) in ctx.unavailable_kernels() {
         println!("UNAVAILABLE {entry}: {why}");
     }
